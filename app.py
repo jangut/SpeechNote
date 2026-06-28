@@ -20,11 +20,27 @@ class Application:
 
     def __init__(self) -> None:
         self._config = Config()
+
+        configure_logger()
         self._logger = get_logger()
+
+        self._event_bus: EventBus | None = None
+
+        self._buffer: RingBuffer[np.ndarray] | None = None
+
+        self._recognizer: BaseRecognizer | None = None
+
+        self._corrector: BaseCorrector | None = None
+
+        self._worker: ASRWorker | None = None
+
+        self._recorder: BaseRecorder | None = None
+
+        self._plugins: list[BasePlugin] = []
         
     def initialize(self) -> None:
         """初始化应用程序。"""
-
+        
         configure_logger()
 
         self._logger.info(
