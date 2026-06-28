@@ -1,4 +1,4 @@
-"""
+﻿"""
 应用程序入口。
 
 Application 是整个工程唯一知道所有对象的人，
@@ -9,14 +9,32 @@ Application 是整个工程唯一知道所有对象的人，
 
 from __future__ import annotations
 
-from core.logger import configure_logger, get_logger
+import time
+
+import numpy as np
 
 from config import Config
+
+from core.event import EventBus
+from core.logger import configure_logger, get_logger
+
+from audio.ringbuffer import RingBuffer
+from audio.base import BaseRecorder
+from audio.recorder import MicrophoneRecorder
+
+from asr.base import BaseRecognizer
+from asr.recognizer import FakeRecognizer
+from asr.worker import ASRWorker
+
+from corrector.base import BaseCorrector
+from corrector.identity import IdentityCorrector
+
+from plugins.base import BasePlugin
+from plugins.markdown import MarkdownPlugin
 
 
 class Application:
     """SpeechNote 应用程序。"""
-
 
     def __init__(self) -> None:
         self._config = Config()
@@ -37,10 +55,10 @@ class Application:
         self._recorder: BaseRecorder | None = None
 
         self._plugins: list[BasePlugin] = []
-        
+
     def initialize(self) -> None:
         """初始化应用程序。"""
-        
+
         configure_logger()
 
         self._logger.info(
@@ -49,28 +67,84 @@ class Application:
             self._config.version,
         )
 
-    def run(self) -> None:
+        self._event_bus = EventBus()
+
+        self._buffer = RingBuffer[np.ndarray]()
+
+        self._recognizer = FakeRecognizer()
+
+        self._corrector = IdentityCorrector()
+
+        self._worker = ASRWorker(
+            buffer=self._buffer,
+            recognizer=self._recognizer,
+            corrector=self._corrector,
+            event_bus=self._event_bus,
+        )
+
+        self._recorder = MicrophoneRecorder(
+            buffer=self._buffer,
+            sample_rate=self._config.sample_rate,
+            channels=self._config.channels,
+            block_size=self._config.block_size,
+        )
+
+        self._plugins = [
+            MarkdownPlugin(output_dir="notes"),
+        ]
+
+        for plugin in self._plugins:
+            plugin.register(self._event_bus)
+
+    def start(self) -> None:
         """启动应用程序。"""
-        self.initialize()
+
+        assert self._recognizer is not None
+        assert self._worker is not None
+        assert self._recorder is not None
+
+        self._recognizer.load_model()
+
+        for plugin in self._plugins:
+            plugin.start()
+
+        self._worker.start()
+
+        self._recorder.start()
 
         self._logger.info("Application started.")
 
+    def wait(self) -> None:
+        """等待程序结束。"""
+
         try:
-            #
-            # 后续：
-            # Recorder
-            # EventBus
-            # ASRWorker
-            # Plugins
-            #
-            pass
+            while True:
+                time.sleep(1)
 
         except KeyboardInterrupt:
-            self._logger.info("Keyboard interrupt received.")
+            self.stop()
 
-        finally:
-            self.shutdown()
+    def stop(self) -> None:
+        """停止应用程序。"""
 
-    def shutdown(self) -> None:
-        """关闭应用程序。"""
-        self._logger.info("Application stopped.")
+        if self._recorder:
+            self._recorder.stop()
+
+        if self._worker:
+            self._worker.stop()
+
+        for plugin in self._plugins:
+            plugin.stop()
+
+        if self._recognizer:
+            self._recognizer.release()
+
+        self._logger.info(
+            "SpeechNote exited."
+        )
+
+    def run(self) -> None:
+        """运行应用程序。"""
+        self.initialize()
+        self.start()
+        self.wait()
