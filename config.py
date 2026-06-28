@@ -26,6 +26,10 @@ class Config:
     device: str = "cpu"
 
     # ── Worker 调度 ──
-    recognize_window: float = 4.0      # 每次送入识别的音频长度（秒）
+    mode: str = "vad"                  # 识别模式: "window" | "vad"
+    recognize_window: float = 8.0     # 每次送入识别的音频长度（秒）
     overlap_window: float = 1.0        # 重叠窗口长度（秒），防止切句
-    enable_vad: bool = False           # 是否启用语音活动检测（预留）
+    vad_threshold: float = 0.005      # VAD 能量阈值
+    silence_timeout: float = 1.0      # 沉默超时（秒），触发提前识别
+    enable_vad: bool = True            # 是否启用语音活动检测
+

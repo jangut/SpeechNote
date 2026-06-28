@@ -82,10 +82,13 @@ class Application:
             recognizer=self._recognizer,
             pipeline=self._pipeline,
             event_bus=self._event_bus,
+            mode=self._config.mode,
             sample_rate=self._config.sample_rate,
             recognize_window=self._config.recognize_window,
             overlap_window=self._config.overlap_window,
             enable_vad=self._config.enable_vad,
+            vad_threshold=self._config.vad_threshold,
+            silence_timeout=self._config.silence_timeout,
         )
 
         self._recorder = MicrophoneRecorder(
