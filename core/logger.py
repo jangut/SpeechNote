@@ -1,4 +1,4 @@
-"""
+﻿"""
 SpeechNote 日志模块。
 
 整个工程统一从这里获取 Logger。
@@ -9,19 +9,26 @@ SpeechNote 日志模块。
 from __future__ import annotations
 
 import logging
-from typing import Final
 
 _LOGGER_NAME = "SpeechNote"
-
 
 
 def configure_logger() -> None:
     """初始化全局 Logger。"""
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(message)s",
+    logger = logging.getLogger(_LOGGER_NAME)
+    if logger.handlers:
+        return
+
+    logger.setLevel(logging.INFO)
+
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s")
     )
+    logger.addHandler(handler)
+
+    logger.propagate = False
 
 
 def get_logger() -> logging.Logger:

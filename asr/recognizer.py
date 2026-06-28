@@ -1,10 +1,16 @@
 ﻿"""
-Fake 语音识别器。
+语音识别器实现。
 
-第一版用于联调，后续替换为 SenseVoice。
+第一版使用 FakeRecognizer 联调，后续替换为 SenseVoice。
 """
 
 from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import re
+from funasr import AutoModel
 
 from core.logger import get_logger
 from core.sentence import Sentence
@@ -50,3 +56,79 @@ class FakeRecognizer(BaseRecognizer):
         """
         self._loaded = False
         self._logger.info("FakeRecognizer released.")
+
+
+class SenseVoiceRecognizer(BaseRecognizer):
+    """
+    SenseVoice 语音识别器。
+    """
+
+    def __init__(
+        self,
+        model_dir: str | Path,
+        device: str = "cpu",
+    ) -> None:
+
+        self._logger = get_logger()
+
+        self._model_dir = Path(model_dir)
+        self._device = device
+
+        self._model: AutoModel | None = None
+
+    def load_model(self) -> None:
+        """
+        加载 SenseVoice 模型。
+        """
+
+        self._logger.info("Loading SenseVoice model...")
+
+        self._model = AutoModel(
+            model=str(self._model_dir),
+            device=self._device,
+            disable_update=True,
+        )
+
+        self._logger.info("SenseVoice model loaded.")
+
+    def recognize(
+        self,
+        audio: np.ndarray,
+    ) -> Sentence:
+        """
+        语音识别。
+        """
+
+        assert self._model is not None
+
+        # (1600, 1) -> (1600,)
+        if audio.ndim == 2:
+            audio = audio.squeeze(axis=1)
+
+        result = self._model.generate(
+            input=audio,
+            disable_pbar=True,
+        )
+
+        text = result[0]["text"]
+        text = re.sub(r"<\|.*?\|>", "", text).strip()
+
+        return Sentence(
+            raw_text=text,
+            text=text,
+            is_final=True,
+            confidence=1.0,
+        )
+
+    def release(self) -> None:
+        """
+        释放模型资源。
+        """
+
+        self._model = None
+
+        self._logger.info("SenseVoice model released.")
+
+
+
+

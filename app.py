@@ -23,7 +23,7 @@ from audio.base import BaseRecorder
 from audio.recorder import MicrophoneRecorder
 
 from asr.base import BaseRecognizer
-from asr.recognizer import FakeRecognizer
+from asr.recognizer import SenseVoiceRecognizer
 from asr.worker import ASRWorker
 
 from corrector.base import BaseCorrector
@@ -71,7 +71,7 @@ class Application:
 
         self._buffer = RingBuffer[np.ndarray]()
 
-        self._recognizer = FakeRecognizer()
+        self._recognizer = SenseVoiceRecognizer(model_dir=self._config.model_dir, device=self._config.device)
 
         self._corrector = IdentityCorrector()
 
@@ -80,6 +80,10 @@ class Application:
             recognizer=self._recognizer,
             corrector=self._corrector,
             event_bus=self._event_bus,
+            sample_rate=self._config.sample_rate,
+            recognize_window=self._config.recognize_window,
+            overlap_window=self._config.overlap_window,
+            enable_vad=self._config.enable_vad,
         )
 
         self._recorder = MicrophoneRecorder(
@@ -148,3 +152,7 @@ class Application:
         self.initialize()
         self.start()
         self.wait()
+
+
+
+

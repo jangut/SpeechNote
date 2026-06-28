@@ -39,6 +39,11 @@ class ASRWorker:
         recognizer: BaseRecognizer,
         corrector: BaseCorrector,
         event_bus: EventBus,
+        *,
+        sample_rate: int,
+        recognize_window: float,
+        overlap_window: float = 0.0,
+        enable_vad: bool = False,
     ) -> None:
 
         self._logger = get_logger()
@@ -50,6 +55,14 @@ class ASRWorker:
 
         self._thread: Thread | None = None
         self._running = False
+
+        self._sample_rate = sample_rate
+        self._required_samples = int(sample_rate * recognize_window)
+        self._overlap_samples = int(sample_rate * overlap_window) if overlap_window > 0 else 0
+        self._enable_vad = enable_vad
+
+        self._audio_cache: list[np.ndarray] = []
+        self._cached_samples = 0
 
     def start(self) -> None:
         """启动工作线程。"""
@@ -74,7 +87,34 @@ class ASRWorker:
             except Exception:
                 continue
 
-            sentence = self._recognizer.recognize()
+            # VAD（预留）
+            if self._enable_vad:
+                pass
+
+            self._audio_cache.append(audio_data)
+            self._cached_samples += len(audio_data)
+
+            if self._cached_samples < self._required_samples:
+                continue
+
+            audio = np.concatenate(self._audio_cache, axis=0)
+
+            # 重叠窗口：保留最后一段供下一轮拼接
+            if self._overlap_samples > 0:
+                keep = audio[-self._overlap_samples:]
+                self._audio_cache = [keep]
+                self._cached_samples = len(keep)
+            else:
+                self._audio_cache.clear()
+                self._cached_samples = 0
+
+            self._logger.info(
+                "Recognize %.2fs audio, shape=%s",
+                len(audio) / self._sample_rate,
+                audio.shape,
+            )
+
+            sentence = self._recognizer.recognize(audio)
             sentence = self._corrector.correct(sentence)
 
             if not sentence.text.strip():
