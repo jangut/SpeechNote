@@ -92,7 +92,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+R"), self, self._toggle_recording)
         QShortcut(QKeySequence("Ctrl+Shift+R"), self, self._stop_recording)
         QShortcut(QKeySequence("Ctrl+K"), self, self._clear_display)
-        QShortcut(QKeySequence("Ctrl+,"), self._show_settings)
+        QShortcut(QKeySequence("Ctrl+,"), self, self._show_settings)
 
     def _toggle_recording(self):
         if self.backend.is_running:

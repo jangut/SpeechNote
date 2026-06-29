@@ -1,4 +1,4 @@
-﻿"""
+"""
 语音识别器实现。
 
 第一版使用 FakeRecognizer 联调，后续替换为 SenseVoice。
@@ -71,7 +71,7 @@ class SenseVoiceRecognizer(BaseRecognizer):
 
         self._logger = get_logger()
 
-        self._model_dir = Path(model_dir)
+        self._model_dir = model_dir
         self._device = device
 
         self._model: AutoModel | None = None
@@ -133,6 +133,7 @@ class SenseVoiceRecognizer(BaseRecognizer):
         self._model = None
 
         self._logger.info("SenseVoice model released.")
+
 
 
 

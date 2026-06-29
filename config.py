@@ -1,4 +1,4 @@
-﻿"""
+"""
 SpeechNote 全局配置。
 
 所有配置统一放在此处，业务模块只读取配置，
@@ -22,7 +22,7 @@ class Config:
     block_size: int = 1600    # 100ms 一帧
 
     # ── 语音识别 ──
-    model_dir: str = r"C:\Users\21592\.cache\modelscope\hub\models\damo\SenseVoiceSmall"
+    model_dir: str = "damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
     device: str = "cpu"
 
     # ── Worker 调度 ──
@@ -32,4 +32,5 @@ class Config:
     vad_threshold: float = 0.005      # VAD 能量阈值
     silence_timeout: float = 1.0      # 沉默超时（秒），触发提前识别
     enable_vad: bool = True            # 是否启用语音活动检测
+
 
