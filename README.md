@@ -87,6 +87,7 @@ python main.py
 - [x] 重叠窗口（Overlap Window，1s 重叠防切句）
 - [x] DuplicateCorrector（最长后缀-前缀匹配去重，倒序 break）
 - [x] CorrectorPipeline（责任链模式，Worker 零耦合）
+- [x] TermCorrector（词典纠错器：拼音模糊 + 精确替换，94 条热词/术语）
 - [x] 识别异常保护（try-except，线程不退出）
 
 ## v0.3 — VAD + 模式系统 + GUI
@@ -98,6 +99,7 @@ python main.py
 - [x] EventBus → Qt 信号桥接（线程安全）
 - [x] 快捷键：Ctrl+R / Ctrl+Shift+R / Ctrl+K / Ctrl+,
 - [x] 设置对话框（Config 自动生成表单）
+- [x] TermCorrector 四项优化：长度缓存 / 只扫中文 / 连续纠错 / 贪心长词优先
 - [x] run_gui.bat — Windows 一键启动
 
 ---
@@ -219,7 +221,7 @@ Worker 内部 try-except，识别异常不退出线程。
 
 ## 近期待做
 
-- [ ] DictionaryCorrector（热词纠正）
+- [x] **TermCorrector（热词纠正）** — 94 条词典，拼音模糊 + 精确替换
 - [ ] NumberCorrector / PunctuationCorrector
 - [ ] VAD 阈值自适应 / GPU 推理支持
 

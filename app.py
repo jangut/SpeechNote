@@ -1,4 +1,4 @@
-﻿"""
+"""
 应用程序入口。
 
 Application 是整个工程唯一知道所有对象的人，
@@ -29,6 +29,7 @@ from asr.worker import ASRWorker
 
 from corrector.pipeline import CorrectorPipeline
 from corrector.duplicate import DuplicateCorrector
+from corrector.identity import TermCorrector
 
 from plugins.base import BasePlugin
 from plugins.markdown import MarkdownPlugin
@@ -76,6 +77,7 @@ class Application:
 
         self._pipeline = CorrectorPipeline([
             DuplicateCorrector(),
+            TermCorrector(),
         ])
 
         self._worker = ASRWorker(
@@ -168,6 +170,8 @@ class Application:
         self.initialize()
         self.start()
         self.wait()
+
+
 
 
 
