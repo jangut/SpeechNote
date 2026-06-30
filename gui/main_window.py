@@ -71,7 +71,7 @@ class MainWindow(QMainWindow):
 
     def _on_sentence(self, sentence):
         self.subtitle.show_sentence(sentence)
-        self.history.append_sentence(sentence)
+        self.history.update_sentence(sentence)
 
     def _show_settings(self):
         dlg = SettingsDialog(self.config, self)

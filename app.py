@@ -30,6 +30,7 @@ from asr.worker import ASRWorker
 from corrector.pipeline import CorrectorPipeline
 from corrector.duplicate import DuplicateCorrector
 from corrector.identity import TermCorrector
+from corrector.llm_corrector import LLMCorrector
 
 from plugins.base import BasePlugin
 from plugins.markdown import MarkdownPlugin
@@ -75,9 +76,24 @@ class Application:
 
         self._recognizer = SenseVoiceRecognizer(model_dir=self._config.model_dir, device=self._config.device)
 
+
+        self._llm_corrector = LLMCorrector(
+            base_url=self._config.llm_base_url,
+            api_key=self._config.llm_api_key,
+            model=self._config.llm_model,
+            provider=self._config.llm_provider,
+            timeout=self._config.llm_timeout,
+            max_retries=self._config.llm_max_retries,
+            max_context_sentences=self._config.llm_max_context_sentences,
+            idle_timeout=self._config.llm_idle_timeout,
+            short_text_threshold=self._config.llm_short_text_threshold,
+            prompt_path=self._config.llm_prompt_file or None,
+            on_update_callback=self._on_llm_correction,
+        )
         self._pipeline = CorrectorPipeline([
             DuplicateCorrector(),
             TermCorrector(),
+            self._llm_corrector,
         ])
 
         self._worker = ASRWorker(
@@ -131,6 +147,7 @@ class Application:
         self._worker.start()
 
         self._recorder.start()
+        self._llm_corrector.start()
 
         self._logger.info("Application started.")
 
@@ -153,6 +170,9 @@ class Application:
         if self._worker:
             self._worker.stop()
 
+        if self._llm_corrector:
+            self._llm_corrector.stop()
+
         for plugin in self._plugins:
             plugin.stop()
 
@@ -164,6 +184,10 @@ class Application:
         self._logger.info(
             "SpeechNote exited."
         )
+
+    def _on_llm_correction(self, sentence: Sentence) -> None:
+        """LLM 修正完成后的回调，重新发射 SENTENCE 事件。"""
+        self._event_bus.emit(Event(Events.SENTENCE, sentence))
 
     def run(self) -> None:
         """运行应用程序。"""
