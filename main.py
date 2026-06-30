@@ -17,12 +17,12 @@ def main() -> None:
     app = Application(config)
     app.initialize()
 
-    if "--gui" in sys.argv:
-        from gui import start_gui
-        start_gui(config, app)
-    else:
+    if "--cli" in sys.argv:
         app.start()
         app.wait()
+    else:
+        from gui import start_gui
+        start_gui(config, app)
 
 
 if __name__ == "__main__":

@@ -221,13 +221,13 @@ Worker 内部 try-except，识别异常不退出线程。
 
 ## 近期待做
 
-- [x] **TermCorrector（热词纠正）** — 94 条词典，拼音模糊 + 精确替换
-- [ ] NumberCorrector / PunctuationCorrector
+- [ ] 大模型的分句有严重问题，容易导致逻辑不连贯，加入graph与大模型协作效果应该更好
+- [ ] 不能识别电脑声音并与麦克风自由转换
+- [ ] 打包出现大量问题
 - [ ] VAD 阈值自适应 / GPU 推理支持
 
 ## 中期目标
 
-- [ ] LLMCorrector（大模型纠错）
 - [ ] Sentence Accumulator
 - [ ] 翻译 / 摘要 / 待办 Plugin
 
@@ -242,6 +242,7 @@ Worker 内部 try-except，识别异常不退出线程。
 - CUDA kernel 不兼容，当前 CPU 推理
 - Paraformer-large 非流式，有固定感受窗口
 - 能量 VAD 在强噪音环境不够准确
+- 逐条输出逐条解析的策略让大模型
 
 ---
 
