@@ -1,452 +1,512 @@
 ﻿"""
-基于大模型的文本纠错器（多缓冲池 + 静默超时版）
+LLM Corrector — 大模型文本纠错模块。
 
-特性：
-- 累积触发：字数达到阈值（默认 短文本阈值） 或 静默超过 timeout（默认0.6秒）
-- 多缓冲池：提交后立即创建新池，未处理的池排队等待
-- 上下文串联：每个池处理时参考前一个池的修正结果，保证段落连贯
-- 实时推送：每处理完一个池即回调，推送该段修正文本和总结
+Architecture:
+┌─────────────┐     ┌──────────────────┐     ┌────────────┐     ┌──────────┐     ┌─────────┐
+│ ASR Pipeline │────▶│ SlidingWindowBuf │────▶│   Queue    │────▶│   Worker  │────▶│ Callback│
+│ correct()    │     │  (2~3句窗口)     │     │SentenceWin │     │LLM+后处理 │     │ Sentence│
+└─────────────┘     └──────────────────┘     └────────────┘     └──────────┘     └─────────┘
+                           ▲
+                      Timer(idle timeout)
 """
 
 from __future__ import annotations
 
-import asyncio
+import logging
 import threading
+import queue
 import time
+import random
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 
 import httpx
 
-from core.logger import get_logger
-from core.sentence import Sentence
-from corrector.base import BaseCorrector
-
-# ── 默认系统 Prompt（批量版）─────────────────────────────
-_DEFAULT_SYSTEM_PROMPT = """\
-你是一个中文会议文本润色专家。输入是一段包含口语化表达的中文文本（可能含 ASR 错误）。
-
-【核心原则】
-1. **仅修正词语**：纠正错别字、专业术语错误（如电路、控制、AI 领域）。除非句子完全不通顺，否则**绝对不要改变原有句式、语序或结构**。
-2. **剔除语气词**：删除无意义的填充词，如“嗯”、“啊”、“那个”、“就是说”、“然后”等，使正文简洁。
-3. **组织为段落**：将修正后的内容组织成一段连贯、通顺的自然段落，不要以列表或逐句形式输出。
-4. **总结与情绪**：在段落末尾，写一段简短的总结（20-30字），概括这段文字的核心内容，并根据原文中的语气词或表达方式，描述说话者的情绪状态（例如：自信、犹豫、激动、严肃、困惑等）。
-
-【输出格式】（必须严格遵守以下标记）
-[修正段落]
-...（这里输出修正后的段落文本）...
-[段落总结]
-...（这里输出总结和情绪描述）...
-"""
-
-_PROVIDER_URLS: dict[str, str] = {
-    "openai": "https://api.openai.com/v1/chat/completions",
-    "qwen": "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation",
-    "glm": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-    "deepseek": "https://api.deepseek.com/v1/chat/completions",
-    "ollama": "http://localhost:11434/v1/chat/completions",
-}
+from core.sentence import Sentence, SourceType
+from corrector import BaseCorrector
 
 
-@dataclass
-class _Buffer:
-    """一个积累单元（缓冲池）"""
+# ==========================================================
+# Configuration
+# ==========================================================
+
+@dataclass(slots=True)
+class LLMConfig:
+    """LLM Corrector 统一配置对象。"""
+
+    # --- 服务商 ---
+    provider: str = "ollama"
+    base_url: str = "http://localhost:11434/v1/chat/completions"
+    api_key: str = "ollama"
+    model: str = "qwen3:8b"
+
+    # --- 请求 ---
+    request_timeout: float = 15.0       # 单次请求超时（秒）
+    max_retries: int = 2                # 最大重试次数
+
+    # --- 窗口策略 ---
+    window_max_sentences: int = 3       # 每个窗口最大句子数
+    window_max_chars: int = 200         # 每个窗口最大字符数
+    idle_timeout: float = 0.6           # 静音触发纠错（秒）
+    short_text_threshold: int = 2       # 短文本触发阈值（字数）
+
+    # --- 其他 ---
+    prompt_path: str = ""               # 自定义 Prompt 文件路径
+
+
+# ==========================================================
+# Constants
+# ==========================================================
+
+_QUEUE_MAXSIZE = 64
+_STOP_SENTINEL = object()
+
+_DEFAULT_SYSTEM_PROMPT = """任务：校对 ASR 文本。
+
+规则：
+1. 只允许修改以下内容：
+   - 错别字
+   - 识别错误
+   - 标点符号
+   - 不通顺的语序
+2. 保持原始句子数量不变，每行一句对应输出一句。
+3. 不得修改原意。
+4. 不得扩写、总结、解释。
+5. 不得添加任何不存在的信息。
+6. 修改幅度保持最小。
+
+输出格式：
+按行输出修正后的句子，一行一句。"""
+
+
+# ==========================================================
+# Data Structures
+# ==========================================================
+
+@dataclass(slots=True)
+class SentenceWindow:
+    """LLM 修正窗口：2~3 句为一个处理单元。"""
     id: int
-    text: str = ""
     sentences: list[Sentence] = field(default_factory=list)
-    last_updated: float = field(default_factory=time.time)
-    status: str = "accumulating"  # accumulating | submitted | processing | done
-    corrected_text: Optional[str] = None
-    summary: Optional[str] = None
-    # 超时任务句柄（用于取消）
-    timeout_task: Optional[asyncio.Task] = None
+    text: str = ""
+    corrected_text: str = ""
+    created_at: float = 0.0
 
 
-class LLMCorrector(BaseCorrector):
-    """
-    多缓冲池 + 静默超时版纠错器。
+class SlidingWindowBuffer:
+    """滑动窗口缓冲池。
+
+    将连续的 Sentence 组织成固定大小的窗口。
+    每个窗口 2~3 句或达到字符上限后自动就绪。
     """
 
     def __init__(
         self,
-        *,
-        base_url: str = "",
-        api_key: str = "",
-        model: str = "",
-        provider: str = "openai",
-        timeout: float = 10.0,          # LLM API 超时
-        max_retries: int = 2,
-        max_context_sentences: int = 3,     # 上下文参考的句子/缓冲池数（兼容旧参数名）
-        idle_timeout: float = 15,          # 静默超时触发纠错（秒）
-        short_text_threshold: int = 2,      # 短文本阈值，累计字数达到此值会考虑提交
-        prompt_path: str | Path | None = None,
-        on_update_callback: Callable[[Sentence], None] | None = None,
+        max_sentences: int = 3,
+        max_chars: int = 200,
     ) -> None:
-        self._logger = get_logger()
-        self._base_url = base_url or _PROVIDER_URLS.get(provider, _PROVIDER_URLS["openai"])
-        self._api_key = api_key
-        self._model = model
-        self._provider = provider
-        self._timeout = timeout
-        self._max_retries = max_retries
-        self._max_context_buffers = max_context_sentences
-        self._idle_timeout = idle_timeout
-        self._batch_threshold = short_text_threshold
-        self._on_update_callback = on_update_callback
+        self._max_sentences = max_sentences
+        self._max_chars = max_chars
+        self._current: SentenceWindow | None = None
+        self._next_id = 1
+        self._logger = logging.getLogger(__name__)
 
-        self._prompt_path = Path(prompt_path) if prompt_path else None
-        self._system_prompt = self._load_prompt()
-        self._prompt_mtime: float = 0.0
-        if self._prompt_path and self._prompt_path.exists():
-            self._prompt_mtime = self._prompt_path.stat().st_mtime
+    def add(self, sentence: Sentence) -> list[SentenceWindow]:
+        """添加一个句子，返回已就绪的窗口列表（0~1个）。"""
+        if self._current is None:
+            self._current = SentenceWindow(
+                id=self._next_id,
+                created_at=time.time(),
+            )
+            self._next_id += 1
 
-        # ---- 缓冲池管理 ----
-        self._buffer_counter = 0
-        self._current_buffer: Optional[_Buffer] = None   # 当前正在积累的池
-        self._pending_buffers: asyncio.Queue = asyncio.Queue()  # 已提交待处理的池
-        self._processed_buffers: list[_Buffer] = []       # 已处理完成的池（用于上文）
-        self._lock = threading.RLock()                     # 保护 current_buffer 切换
+        # 带分隔符追加（避免文本粘连）
+        delimiter = "" if not self._current.text else " "
+        self._current.text += delimiter + sentence.text
+        self._current.sentences.append(sentence)
 
-        # ---- 异步基础设施 ----
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
+        # 窗口已满 → 就绪
+        if self._is_ready():
+            ready = self._current
+            self._current = None
+            return [ready]
+
+        return []
+
+    def _is_ready(self) -> bool:
+        """窗口是否已满（句子数或字符数任一达到上限）。"""
+        if self._current is None:
+            return False
+        if len(self._current.sentences) >= self._max_sentences:
+            return True
+        if len(self._current.text) >= self._max_chars:
+            return True
+        return False
+
+    def has_pending(self) -> bool:
+        """是否存在未提交的窗口内容。"""
+        return (
+            self._current is not None
+            and len(self._current.sentences) > 0
+        )
+
+    def flush_current(self) -> SentenceWindow | None:
+        """强制取出当前窗口（无论是否已满）。"""
+        if not self.has_pending():
+            return None
+        window = self._current
+        self._current = None
+        return window
+
+    def reset(self) -> None:
+        """重置所有状态。"""
+        self._current = None
+        self._next_id = 1
+
+
+# ==========================================================
+# LLM Corrector
+# ==========================================================
+
+class LLMCorrector(BaseCorrector):
+
+    # ======================================================
+    # Lifecycle
+    # ======================================================
+
+    def __init__(
+        self,
+        config: LLMConfig,
+        callback: Callable[[Sentence], None] | None = None,
+    ) -> None:
+        """初始化 LLM Corrector。
+
+        Parameters
+        ----------
+        config : LLMConfig
+            配置对象。
+        callback : Callable[[Sentence], None] | None
+            修正完成的回调，参数为修正后的 Sentence（llm_corrected=True）。
+        """
+        self._logger = logging.getLogger(__name__)
+
+        # --- 配置 ---
+        self._config = config
+        self._idle_timeout = config.idle_timeout
+        self._short_text_threshold = config.short_text_threshold
+        self._model = config.model
+        self._api_key = config.api_key
+        self._request_timeout = config.request_timeout
+        self._retry_count = config.max_retries
+        self._prompt_path = config.prompt_path
+
+        # --- API URL（自动识别 Ollama 原生 / OpenAI 格式） ---
+        self._api_url, self._openai_mode = self._resolve_api_url(config.base_url)
+
+        # --- 滑动窗口缓冲 ---
+        self._buffer = SlidingWindowBuffer(
+            max_sentences=config.window_max_sentences,
+            max_chars=config.window_max_chars,
+        )
+
+        # --- 队列（传输 SentenceWindow） ---
+        self._queue: queue.Queue[object] = queue.Queue(maxsize=_QUEUE_MAXSIZE)
+
+        # --- 线程 ---
+        self._worker_thread: threading.Thread | None = None
+        self._timer_thread: threading.Thread | None = None
         self._running = False
 
-        # ---- 统计 ----
-        self._stats = {"total": 0, "modified": 0, "errors": 0, "tokens": 0}
+        # --- Timer 状态 ---
+        self._last_input_time = 0.0
+        self._flush_lock = threading.Lock()
+        self._flushing = False
 
-        # 初始化当前缓冲池
-        self._create_new_buffer()
+        # --- System prompt ---
+        self._system_prompt = _DEFAULT_SYSTEM_PROMPT
 
-        self._logger.info("LLMCorrector 多缓冲池版启动: provider=%s, threshold=%s, idle_timeout=%ss",
-                          self._provider, self._batch_threshold, self._idle_timeout,)
+        # --- Callback ---
+        self._callback = callback
 
-    # ── 缓冲池管理（线程安全） ────────────────────────────
-
-    def _create_new_buffer(self) -> None:
-        """创建新的当前缓冲池（加锁）"""
-        with self._lock:
-            self._buffer_counter += 1
-            buf = _Buffer(id=self._buffer_counter)
-            self._current_buffer = buf
-            self._logger.debug("创建新缓冲池 id=%s", buf.id)
-            # 超时由 correct() 在首次写入文本时安排
-
-    def _get_current_buffer(self) -> _Buffer:
-        """获取当前缓冲池（线程安全）"""
-        with self._lock:
-            return self._current_buffer
-
-    def _swap_buffer(self, old_buffer: _Buffer) -> None:
-        """提交旧池，创建新池（由 correct 或超时触发）"""
-        # 先确保旧池被标记为 submitted 并放入队列
-        old_buffer.status = "submitted"
-        old_buffer.last_updated = time.time()
-        # 取消其超时任务（如果存在）
-        if old_buffer.timeout_task and not old_buffer.timeout_task.done():
-            old_buffer.timeout_task.cancel()
-        # 放入待处理队列
-        asyncio.run_coroutine_threadsafe(
-            self._pending_buffers.put(old_buffer), self._loop
-        )
-        self._logger.info("提交缓冲池 id=%s, 字数=%s", old_buffer.id, len(old_buffer.text))
-        # 创建新池
-        self._create_new_buffer()
-
-    # ── 超时管理（异步） ──────────────────────────────────
-
-    async def _schedule_timeout(self, buf: _Buffer) -> None:
-        """为缓冲池安排一个超时任务，到期自动提交"""
-        if buf.timeout_task and not buf.timeout_task.done():
-            buf.timeout_task.cancel()
-        # 创建新任务
-        task = asyncio.create_task(self._timeout_worker(buf))
-        buf.timeout_task = task
-        try:
-            await task
-        except asyncio.CancelledError:
-            self._logger.debug("缓冲池 id=%s 超时任务被取消", buf.id)
-
-    async def _timeout_worker(self, buf: _Buffer) -> None:
-        """等待 idle_timeout 秒，若期间未取消且池中有文本则提交"""
-        await asyncio.sleep(self._idle_timeout)
-        with self._lock:
-            if (self._current_buffer is buf
-                    and buf.status == "accumulating"
-                    and buf.text.strip()):
-                self._logger.info("缓冲池 id=%s 静默超时，自动提交", buf.id)
-                self._swap_buffer(buf)
-            else:
-                self._logger.debug("缓冲池 id=%s 已非当前池或已提交，忽略超时", buf.id)
-
-    # ── 生命周期 ────────────────────────────────────────────
+    @staticmethod
+    def _resolve_api_url(base_url: str) -> tuple[str, bool]:
+        """解析 API URL，返回 (完整URL, 是否为OpenAI格式)。"""
+        base = base_url.strip().rstrip("/")
+        if not base:
+            base = "http://localhost:11434"
+        if base.endswith("/chat/completions"):
+            return base, True
+        if base.endswith("/v1"):
+            return base + "/chat/completions", True
+        if "/v1" in base:
+            return base + "/chat/completions", True
+        return base + "/api/chat", False
 
     def start(self) -> None:
+        """启动后台线程。"""
         if self._running:
             return
-        if not self._api_key:
-            self._logger.warning("LLMCorrector 未配置 api_key，跳过启动")
-            return
-
         self._running = True
-        self._logger.info("LLMCorrector Worker 启动中...")
-        self._thread = threading.Thread(target=self._run_event_loop, daemon=True)
-        self._thread.start()
-        while self._loop is None:
-            time.sleep(0.001)
-        self._logger.info("LLMCorrector Worker 已启动")
-
-    def _run_event_loop(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._worker_loop())
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop, name="LLMWorker", daemon=True,
+        )
+        self._worker_thread.start()
+        self._timer_thread = threading.Thread(
+            target=self._timer_loop, name="LLMTimer", daemon=True,
+        )
+        self._timer_thread.start()
+        self._logger.info("LLM Corrector started.")
 
     def stop(self) -> None:
+        """停止后台线程。"""
         if not self._running:
             return
-        # 先提交当前池（强制）
-        self.flush()
         self._running = False
-        self._logger.info("LLMCorrector Worker 停止中...")
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-        self._loop = None
-        self._thread = None
-        self._logger.info("LLMCorrector Worker 已停止")
 
-    # ── 纠错入口（同步，非阻塞） ─────────────────────────
+        # Stop sentinel：通知 worker 线程退出
+        try:
+            self._queue.put_nowait(_STOP_SENTINEL)
+        except queue.Full:
+            pass
+
+        if self._worker_thread is not None:
+            self._worker_thread.join(timeout=3.0)
+        if self._timer_thread is not None:
+            self._timer_thread.join(timeout=3.0)
+
+        self._logger.info("LLM Corrector stopped.")
+
+    # ======================================================
+    # Public API
+    # ======================================================
 
     def correct(self, sentence: Sentence) -> Sentence:
-        """累积句子到当前缓冲池，触发条件时自动提交"""
-        if not sentence.text.strip() or not self._api_key:
+        """接收 ASR Sentence：输入层 + 透传原句。
+
+        - 将句子输入到滑动窗口缓冲
+        - 窗口满后自动提交到处理队列
+        - 立即返回原句（透传），不阻塞 pipeline
+        - LLM 修正结果通过 callback 返回
+        """
+        if not self._running:
+            return sentence
+        if not sentence or not sentence.text or not sentence.text.strip():
             return sentence
 
-        buf = self._get_current_buffer()
-        # 追加文本（加句号保证断句）
-        buf.text += sentence.text.strip() + "。"
-        buf.sentences.append(sentence)
-        buf.last_updated = time.time()
+        # 输入到滑动窗口
+        ready = self._buffer.add(sentence)
+        self._last_input_time = time.time()
 
-        # 重置超时任务（取消旧任务，创建新任务）
-        if self._loop and self._running:
-            asyncio.run_coroutine_threadsafe(
-                self._schedule_timeout(buf), self._loop
-            )
+        # 短文本立即触发提交
+        if len(sentence.text) <= self._short_text_threshold:
+            self.flush()
 
-        # 检查是否达到字数阈值
-        if len(buf.text) >= self._batch_threshold:
-            self._logger.debug("缓冲池 id=%s 达到字数阈值，提交", buf.id)
-            with self._lock:
-                if self._current_buffer is buf and buf.status == "accumulating":
-                    self._swap_buffer(buf)
+        # 提交已就绪的窗口
+        for window in ready:
+            self._submit_window(window)
 
         return sentence
 
-    # ── 强制刷新 ──────────────────────────────────────────
-
     def flush(self) -> None:
-        """立即提交当前缓冲池（即使不足阈值）"""
-        buf = self._get_current_buffer()
-        if buf and buf.text and buf.status == "accumulating":
-            with self._lock:
-                if self._current_buffer is buf:
-                    self._logger.info("强制提交缓冲池 id=%s", buf.id)
-                    self._swap_buffer(buf)
+        """强制提交当前未满的窗口（带防重复锁）。"""
+        with self._flush_lock:
+            if self._flushing:
+                return
+            self._flushing = True
 
-    # ── 后台工作者循环 ──────────────────────────────────────
+        try:
+            window = self._buffer.flush_current()
+            if window is not None:
+                self._submit_window(window)
+        finally:
+            self._flushing = False
 
-    async def _worker_loop(self) -> None:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            while self._running:
+    # ======================================================
+    # Window Submission
+    # ======================================================
+
+    def _submit_window(self, window: SentenceWindow) -> None:
+        """提交一个窗口到处理队列。"""
+        try:
+            self._queue.put_nowait(window)
+            self._logger.info(
+                "提交窗口 id=%d, %d句, %d字",
+                window.id, len(window.sentences), len(window.text),
+            )
+        except queue.Full:
+            self._logger.warning("队列已满，丢弃窗口 id=%d", window.id)
+
+    # ======================================================
+    # Timer
+    # ======================================================
+
+    def _timer_loop(self) -> None:
+        """静默超时检测线程（带 jitter 防固定轮询）。"""
+        while self._running:
+            sleep_time = 0.3 + random.uniform(0, 0.1)
+            time.sleep(sleep_time)
+
+            if not self._running:
+                break
+            if not self._buffer.has_pending():
+                continue
+
+            elapsed = time.time() - self._last_input_time
+            if elapsed >= self._idle_timeout:
+                self._logger.info("静默超时，自动提交")
+                self.flush()
+
+    # ======================================================
+    # Worker
+    # ======================================================
+
+    def _worker_loop(self) -> None:
+        """后台线程：消费队列中的 SentenceWindow 并调用 LLM。"""
+        while self._running:
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            # Stop sentinel
+            if item is _STOP_SENTINEL:
+                break
+            if not isinstance(item, SentenceWindow):
+                continue
+
+            try:
+                self._process_window(item)
+            except Exception as e:
+                self._logger.exception("Worker error, re-queue: %s", e)
+                # 异常 fallback：重新入队（最多一次）
                 try:
-                    buf = await asyncio.wait_for(
-                        self._pending_buffers.get(), timeout=0.1
-                    )
-                except asyncio.TimeoutError:
-                    continue
-                except asyncio.CancelledError:
-                    break
+                    self._queue.put_nowait(item)
+                except queue.Full:
+                    self._logger.error("队列满，无法重新入队窗口 id=%d", item.id)
 
-                try:
-                    await self._process_buffer(client, buf)
-                except Exception as e:
-                    self._logger.exception("处理缓冲池 id=%s 失败: %s", buf.id, e)
-                    self._stats["errors"] += 1
-                self._pending_buffers.task_done()
+    def _process_window(self, window: SentenceWindow) -> None:
+        """处理窗口：调用 LLM 修正，后处理，创建修正后的 Sentence。"""
+        if not window.text.strip():
+            self._logger.warning("跳过空窗口 id=%d", window.id)
+            return
 
-    async def _process_buffer(self, client: httpx.AsyncClient, buf: _Buffer) -> None:
-        """处理单个缓冲池：调用 LLM，设置修正结果，回调"""
-        start_time = time.perf_counter()
+        prompt = self._build_prompt(window)
+        result = self._call_llm(prompt)
 
-        # 获取上文：取最近几个已处理完的池的修正结果
-        context_text = ""
-        if self._processed_buffers:
-            # 取最多 max_context_buffers 个已处理池的修正结果拼接
-            recent = self._processed_buffers[-self._max_context_buffers:]
-            context_text = " ".join([b.corrected_text or b.text for b in recent])
+        if not result or not result.strip():
+            self._logger.warning("LLM 返回空结果，窗口 id=%d", window.id)
+            return
 
-        # 调用 LLM
-        corrected, summary = await self._call_llm_batch_with_retry(
-            client, buf.text, context_text
+        # 后处理：行数对齐 + 安全过滤
+        result = self._post_filter(result, window)
+        window.corrected_text = result
+
+        # 创建修正后的 Sentence
+        original = window.sentences[-1] if window.sentences else None
+        corrected = Sentence(
+            raw_text=window.text,
+            text=result,
+            start_time=original.start_time if original else 0.0,
+            end_time=original.end_time if original else 0.0,
+            source=original.source if original else SourceType.MICROPHONE,
+            is_final=True,
+            llm_corrected=True,
         )
 
-        latency = (time.perf_counter() - start_time) * 1000
-
-        if corrected is not None and corrected != buf.text:
-            buf.corrected_text = corrected
-            buf.summary = summary
-            buf.status = "done"
-            self._processed_buffers.append(buf)
-            if len(self._processed_buffers) > self._max_context_buffers * 2:
-                self._processed_buffers = self._processed_buffers[-self._max_context_buffers:]
-
-            self._stats["modified"] += 1
-            self._logger.info(
-                "缓冲池 id=%s 修正成功: 原长=%s, 修正长=%s, 耗时=%.0fms",
-                buf.id, len(buf.text), len(corrected), latency
-            )
-            if summary:
-                self._logger.info("段落总结: %s", summary)
-
-            # 回调：将修正段落作为一个独立的新 Sentence 发出，不破坏原始句子
-            if buf.sentences and self._on_update_callback:
-                merged = Sentence(
-                    raw_text=buf.text,
-                    text=corrected,
-                    is_final=True,
-                    llm_corrected=True,
-                    batch_summary=summary,
-                    start_time=buf.sentences[0].start_time,
-                    end_time=buf.sentences[-1].end_time,
-                )
-                self._on_update_callback(merged)
-        else:
-            self._logger.debug("缓冲池 id=%s 修正无变化或失败", buf.id)
-        self._stats["total"] += 1
-
-    # ── LLM 调用（与之前类似，但改为接收文本） ────────────
-
-    async def _call_llm_batch_with_retry(
-        self, client: httpx.AsyncClient, raw_text: str, context_text: str
-    ) -> tuple[Optional[str], Optional[str]]:
-        """带重试的 LLM 调用，返回 (修正段落, 总结)"""
-        last_exception = None
-        base_delay = 1.0
-        for attempt in range(self._max_retries + 1):
+        if self._callback:
             try:
-                return await self._call_llm_batch_once(client, raw_text, context_text)
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code
-                if status in (400, 401, 403, 413, 422):
-                    self._logger.warning("不可重试错误 %s: %s", status, e.response.text)
-                    return None, None
-                if status == 429 or status >= 500:
-                    delay = base_delay * (2 ** attempt) + 0.1
-                    self._logger.warning(
-                        "请求失败 %s，%.1fs 后重试 (attempt %s/%s)",
-                        status, delay, attempt + 1, self._max_retries + 1
-                    )
-                    await asyncio.sleep(delay)
-                    last_exception = e
-                    continue
-                self._logger.error("未预期的 HTTP 错误: %s", e.response.text)
-                return None, None
-            except (httpx.TimeoutException, httpx.NetworkError) as e:
-                delay = base_delay * (2 ** attempt) + 0.1
-                self._logger.warning(
-                    "网络超时，%.1fs 后重试 (attempt %s/%s)",
-                    delay, attempt + 1, self._max_retries + 1
-                )
-                await asyncio.sleep(delay)
-                last_exception = e
-                continue
-        self._logger.error("重试全部失败: %s", last_exception)
-        return None, None
+                self._callback(corrected)
+            except Exception as e:
+                self._logger.exception("Callback error: %s", e)
 
-    async def _call_llm_batch_once(
-        self, client: httpx.AsyncClient, raw_text: str, context_text: str
-    ) -> tuple[Optional[str], Optional[str]]:
-        self._reload_prompt_if_changed()
+        self._logger.info(
+            "修正完成: 窗口 id=%d, %d句, %d字 -> %d字",
+            window.id, len(window.sentences), len(window.text), len(result),
+        )
 
-        user_content = f"上文（仅供参考）：{context_text}\n\n待修正文本：{raw_text}" if context_text else f"待修正文本：{raw_text}"
+    # ======================================================
+    # Prompt Building
+    # ======================================================
 
-        messages = [
-            {"role": "system", "content": self._system_prompt},
-            {"role": "user", "content": user_content},
-        ]
-        payload = {
-            "model": self._model,
-            "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 1024,
-        }
-        headers = {
-            "Authorization": f"Bearer {self._api_key}",
-            "Content-Type": "application/json",
-        }
-
-        resp = await client.post(self._base_url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-
-        usage = data.get("usage", {})
-        self._stats["tokens"] += usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-
-        content = data["choices"][0]["message"]["content"].strip()
-        article, summary = self._parse_batch_response(content)
-        if article is not None:
-            return article, summary
-        # 容错
-        self._logger.warning("未检测到标准标记，将整个响应作为修正段落")
-        return content, None
-
-    def _parse_batch_response(self, content: str) -> tuple[Optional[str], Optional[str]]:
-        article_marker = "[修正段落]"
-        summary_marker = "[段落总结]"
-        article, summary = None, None
-        if article_marker in content:
-            idx_article = content.find(article_marker)
-            rest = content[idx_article + len(article_marker):].strip()
-            if summary_marker in rest:
-                idx_summary = rest.find(summary_marker)
-                article = rest[:idx_summary].strip()
-                summary = rest[idx_summary + len(summary_marker):].strip()
-            else:
-                article = rest.strip()
-        return article, summary
-
-    # ── Prompt 管理（同前） ──────────────────────────────
+    def _build_prompt(self, window: SentenceWindow) -> str:
+        """构建 Prompt：窗口内句子按行排列。"""
+        system_prompt = self._load_prompt()
+        input_text = window.text
+        return f"{system_prompt}\n\n{input_text}"
 
     def _load_prompt(self) -> str:
-        if not self._prompt_path or not self._prompt_path.exists():
-            return _DEFAULT_SYSTEM_PROMPT
-        try:
-            import yaml
-            with open(self._prompt_path, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f)
-                return data.get("system_prompt", _DEFAULT_SYSTEM_PROMPT)
-        except Exception as e:
-            self._logger.warning("加载 Prompt 失败: %s，使用默认值", e)
-            return _DEFAULT_SYSTEM_PROMPT
+        """加载 Prompt，优先从文件读取。"""
+        if self._prompt_path:
+            try:
+                from pathlib import Path
+                path = Path(self._prompt_path)
+                if path.exists():
+                    return path.read_text(encoding="utf-8")
+            except Exception:
+                self._logger.warning("读取 Prompt 文件失败: %s", self._prompt_path)
+        return self._system_prompt
 
-    def _reload_prompt_if_changed(self) -> None:
-        if not self._prompt_path or not self._prompt_path.exists():
-            return
-        try:
-            mtime = self._prompt_path.stat().st_mtime
-            if mtime > self._prompt_mtime:
-                self._system_prompt = self._load_prompt()
-                self._prompt_mtime = mtime
-                self._logger.info("Prompt 已热更新")
-        except Exception as e:
-            self._logger.warning("检查 Prompt 更新失败: %s", e)
+    # ======================================================
+    # Post-processing
+    # ======================================================
 
-    # ── 工具方法 ──────────────────────────────────────────
+    @staticmethod
+    def _post_filter(result: str, window: SentenceWindow) -> str:
+        """二次过滤：行数对齐 + 空行清理。"""
+        if not result or not result.strip():
+            return result
 
-    def get_stats(self) -> dict[str, int]:
-        return self._stats.copy()
+        result_lines = [line.strip() for line in result.strip().split("\n") if line.strip()]
 
-    @property
-    def stats(self) -> dict[str, int]:
-        return self._stats
+        # 若 LLM 输出了过多行，截断到接近输入行数
+        input_line_count = max(1, len(window.text.strip().split("\n")))
+        if len(result_lines) > input_line_count:
+            result_lines = result_lines[:input_line_count]
+
+        return "\n".join(result_lines)
+
+    # ======================================================
+    # LLM Client
+    # ======================================================
+
+    def _call_llm(self, prompt: str) -> str:
+        """调用 LLM 接口，带指数退避重试。"""
+        headers = {}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+
+        payload = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {
+                "num_predict": 512,
+                "temperature": 0.1,
+            },
+        }
+
+        last_error = None
+        for attempt in range(self._retry_count + 1):
+            try:
+                resp = httpx.post(
+                    self._api_url, json=payload, headers=headers,
+                    timeout=self._request_timeout,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if self._openai_mode:
+                    return data["choices"][0]["message"]["content"]
+                else:
+                    return data["message"]["content"]
+            except Exception as e:
+                last_error = e
+                if attempt < self._retry_count:
+                    wait = (2 ** attempt) * 0.5  # 指数退避: 0.5s, 1s, 2s
+                    self._logger.warning(
+                        "LLM 请求失败 (第%d次重试, %.1fs后): %s",
+                        attempt + 1, wait, e,
+                    )
+                    time.sleep(wait)
+
+        self._logger.error("LLM 请求全部失败: %s", last_error)
+        return ""

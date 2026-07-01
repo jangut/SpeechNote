@@ -34,6 +34,8 @@ from corrector.duplicate import DuplicateCorrector
 from corrector.identity import TermCorrector
 from corrector.llm_corrector import LLMCorrector
 
+from corrector.llm_corrector import LLMConfig
+
 from plugins.base import BasePlugin
 from plugins.markdown import MarkdownPlugin
 
@@ -79,19 +81,25 @@ class Application:
         self._recognizer = SenseVoiceRecognizer(model_dir=self._config.model_dir, device=self._config.device)
 
 
-        self._llm_corrector = LLMCorrector(
+        llm_config = LLMConfig(
+            provider=self._config.llm_provider,
             base_url=self._config.llm_base_url,
             api_key=self._config.llm_api_key,
             model=self._config.llm_model,
-            provider=self._config.llm_provider,
-            timeout=self._config.llm_timeout,
+            request_timeout=self._config.llm_timeout,
             max_retries=self._config.llm_max_retries,
-            max_context_sentences=self._config.llm_max_context_sentences,
+            window_max_sentences=self._config.llm_max_context_sentences,
+            window_max_chars=200,
             idle_timeout=self._config.llm_idle_timeout,
             short_text_threshold=self._config.llm_short_text_threshold,
-            prompt_path=self._config.llm_prompt_file or None,
-            on_update_callback=self._on_llm_correction,
+            prompt_path=self._config.llm_prompt_file or "",
         )
+
+        self._llm_corrector = LLMCorrector(
+            config=llm_config,
+            callback=self._on_llm_correction,
+        )
+
         self._pipeline = CorrectorPipeline([
             DuplicateCorrector(),
             TermCorrector(),
