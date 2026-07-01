@@ -1,0 +1,2 @@
+model_name: damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch
+output_dir: C:\Git\repositories\AI_ASR\onnx_export

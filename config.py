@@ -14,15 +14,17 @@ class Config:
 
     # ── 基本信息 ──
     app_name: str = "SpeechNote"      # 应用名称，用于日志/UI 显示
-    version: str = "0.3.0"           # 当前版本号
+    version: str = "1.2.0"           # 当前版本号
 
     # ── 音频采集参数 ──
     sample_rate: int = 16000          # 采样率（Hz），ASR 模型通常要求 16kHz
     channels: int = 1                 # 单声道，麦克风输入通常为单声道
     block_size: int = 1600            # 每次读取的音频帧大小（样本数），对应 100ms（16000*0.1）
+    audio_source: str = "microphone"  # 音频来源："microphone" | "system" | "file"
+    audio_file_path: str = ""         # 音频文件路径（仅在 audio_source="file" 时有效）
 
     # ── 语音识别（ASR）参数 ──
-    model_dir: str = "damo/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch"
+    model_dir: str = "damo/SenseVoiceSmall"
                                       # Paraformer 中文模型，也可换为其他 ModelScope 模型
     device: str = "cpu"               # 推理设备：'cpu' 或 'cuda'（若 GPU 可用推荐 'cuda'）
 

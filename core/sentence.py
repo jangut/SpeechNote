@@ -8,11 +8,11 @@ SpeechNote 统一文本数据模型。
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from uuid import UUID, uuid4
 
 
-class SourceType(StrEnum):
+class SourceType(str, Enum):
     """语音来源。"""
 
     MICROPHONE = "microphone"

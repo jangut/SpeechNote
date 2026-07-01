@@ -5,10 +5,10 @@
 统一引用 Events.xxx。
 """
 
-from enum import StrEnum
+from enum import Enum
 
 
-class Events(StrEnum):
+class Events(str, Enum):
     """系统事件。"""
 
     START = "start"

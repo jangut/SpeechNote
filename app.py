@@ -21,7 +21,9 @@ from core.logger import configure_logger, get_logger
 
 from audio.ringbuffer import RingBuffer
 from audio.base import BaseRecorder
-from audio.recorder import MicrophoneRecorder
+from audio.mic import MicrophoneRecorder
+from audio.system import SystemAudioRecorder
+from audio.file import FileRecorder
 
 from asr.base import BaseRecognizer
 from asr.recognizer import SenseVoiceRecognizer
@@ -188,6 +190,43 @@ class Application:
     def _on_llm_correction(self, sentence: Sentence) -> None:
         """LLM 修正完成后的回调，重新发射 SENTENCE 事件。"""
         self._event_bus.emit(Event(Events.SENTENCE, sentence))
+
+    def _create_recorder(self, source_type: str | None = None, file_path: str = "") -> BaseRecorder:
+        """根据配置创建对应的录音器。"""
+        source = source_type if source_type is not None else self._config.audio_source
+        if source == "system":
+            return SystemAudioRecorder(
+                buffer=self._buffer,
+                sample_rate=self._config.sample_rate,
+                channels=self._config.channels,
+                block_size=self._config.block_size,
+            )
+        elif source == "file":
+            return FileRecorder(
+                buffer=self._buffer,
+                file_path=file_path or self._config.audio_file_path,
+                sample_rate=self._config.sample_rate,
+                channels=self._config.channels,
+                block_size=self._config.block_size,
+            )
+        else:
+            return MicrophoneRecorder(
+                buffer=self._buffer,
+                sample_rate=self._config.sample_rate,
+                channels=self._config.channels,
+                block_size=self._config.block_size,
+            )
+
+    def switch_audio_source(self, source_type: str, file_path: str = "") -> None:
+        """运行时切换音频来源，不重启整个管线。"""
+        if self._recorder:
+            self._recorder.stop()
+        if source_type == "file" and not file_path:
+            self._logger.warning("切换到文件来源但未指定文件路径")
+            return
+        self._recorder = self._create_recorder(source_type=source_type, file_path=file_path)
+        self._recorder.start()
+        self._logger.info("音频来源已切换为: %s", source_type)
 
     def run(self) -> None:
         """运行应用程序。"""
