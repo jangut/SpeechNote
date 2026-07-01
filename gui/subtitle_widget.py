@@ -1,6 +1,6 @@
-'''
+"""
 最新句子展示，高亮动画。
-'''
+"""
 from PySide6.QtWidgets import QFrame, QVBoxLayout, QLabel
 from PySide6.QtCore import Qt, QTimer
 

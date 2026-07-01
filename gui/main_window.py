@@ -1,8 +1,6 @@
-'''
+"""
 主窗口，拼合所有控件。
-'''
-
-
+"""
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
@@ -23,7 +21,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config = config
         self.bridge = event_bridge
-        self.backend = backend_controller  # 提供 start/stop 等方法
+        self.backend = backend_controller
         self._setup_ui()
         self._connect_signals()
         self._setup_shortcuts()
@@ -47,16 +45,26 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(4, 4, 4, 4)
 
         self.subtitle = SubtitleWidget()
-        self.history = HistoryWidget()
+        self.history_raw = HistoryWidget()
+        self.history_raw.setPlaceholderText("🗣 语音识别输出")
+        self.history_corrected = HistoryWidget()
+        self.history_corrected.setPlaceholderText("🤖 LLM 修正输出")
         self.status_bar = StatusBar()
 
-        splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.subtitle)
-        splitter.addWidget(self.history)
-        splitter.setStretchFactor(0, 2)
-        splitter.setStretchFactor(1, 3)
+        # 上下结构：上字幕，下左右双列
+        history_splitter = QSplitter(Qt.Horizontal)
+        history_splitter.addWidget(self.history_raw)
+        history_splitter.addWidget(self.history_corrected)
+        history_splitter.setStretchFactor(0, 1)
+        history_splitter.setStretchFactor(1, 1)
 
-        right_layout.addWidget(splitter, 1)
+        outer_splitter = QSplitter(Qt.Vertical)
+        outer_splitter.addWidget(self.subtitle)
+        outer_splitter.addWidget(history_splitter)
+        outer_splitter.setStretchFactor(0, 2)
+        outer_splitter.setStretchFactor(1, 3)
+
+        right_layout.addWidget(outer_splitter, 1)
         right_layout.addWidget(self.status_bar)
 
         main_layout.addWidget(right_panel, 5)
@@ -71,13 +79,15 @@ class MainWindow(QMainWindow):
 
     def _on_sentence(self, sentence):
         self.subtitle.show_sentence(sentence)
-        self.history.update_sentence(sentence)
+        if sentence.llm_corrected:
+            self.history_corrected.update_sentence(sentence)
+        else:
+            self.history_raw.update_sentence(sentence)
 
     def _show_settings(self):
         dlg = SettingsDialog(self.config, self)
         if dlg.exec():
             new_conf = dlg.get_config_dict()
-            # 这里可以触发重启后端或提示重启生效
             QMessageBox.information(self, "提示", "设置将在重启后生效")
 
     def _show_help(self):
@@ -99,7 +109,7 @@ class MainWindow(QMainWindow):
             self.backend.pause()
             self.status_bar.update_field("recording", "false")
         else:
-            self.backend.start()   # 可能需要异步
+            self.backend.start()
             self.status_bar.update_field("recording", "true")
 
     def _stop_recording(self):
@@ -108,4 +118,5 @@ class MainWindow(QMainWindow):
 
     def _clear_display(self):
         self.subtitle.clear()
-        self.history.clear()
+        self.history_raw.clear()
+        self.history_corrected.clear()

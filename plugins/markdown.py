@@ -26,7 +26,8 @@ class MarkdownPlugin(BasePlugin):
         self._logger = get_logger()
         self._output_dir = Path(output_dir)
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        self._file: Path | None = None
+        self._file_raw: Path | None = None
+        self._file_corrected: Path | None = None
 
     def register(self, event_bus: EventBus) -> None:
         """
@@ -43,33 +44,39 @@ class MarkdownPlugin(BasePlugin):
         )
 
     def start(self) -> None:
-        """
-        启动插件。
-        """
+        """启动插件，创建原始笔记和修正后笔记两个文件。"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self._file = self._output_dir / f"notes_{timestamp}.md"
-        self._file.write_text(f"# SpeechNote 笔记\n\n", encoding="utf-8")
-        self._logger.info("MarkdownPlugin started: %s", self._file)
+        self._file_raw = self._output_dir / f"notes_{timestamp}_raw.md"
+        self._file_corrected = self._output_dir / f"notes_{timestamp}_corrected.md"
+        for f in (self._file_raw, self._file_corrected):
+            f.write_text("# SpeechNote 笔记\n\n", encoding="utf-8")
+        self._logger.info("MarkdownPlugin started: raw=%s, corrected=%s",
+                          self._file_raw.name, self._file_corrected.name)
 
     def stop(self) -> None:
-        """
-        停止插件。
-        """
-        if self._file:
-            self._file = None
+        """停止插件。"""
+        self._file_raw = None
+        self._file_corrected = None
         self._logger.info("MarkdownPlugin stopped.")
 
     def _on_sentence(self, event: Event) -> None:
-        """
-        处理识别结果事件。
-        """
-        if self._file is None:
+        """处理识别结果事件，按 llm_corrected 分流到不同文件。"""
+        sentence = event.data
+        if not sentence.text.strip():
             return
 
-        sentence = event.data
-        line = f"- {sentence.text}\n"
-        with self._file.open("a", encoding="utf-8") as f:
-            f.write(line)
+        if sentence.llm_corrected:
+            if self._file_corrected is None:
+                return
+            line = f"- {sentence.text}\n"
+            with self._file_corrected.open("a", encoding="utf-8") as f:
+                f.write(line)
+        else:
+            if self._file_raw is None:
+                return
+            line = f"- {sentence.text}\n"
+            with self._file_raw.open("a", encoding="utf-8") as f:
+                f.write(line)
 
     def _on_error(self, event: Event) -> None:
         """
